@@ -3,6 +3,12 @@ import pygame
 from collections import deque
 import numpy as np
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from torch.distributions import Categorical
+
 
 class RouteFind:
     ACTIONS = {
@@ -171,6 +177,31 @@ class RouteFind:
                     queue.append(((nr, nc), dist + 1))
 
         return None
+    
+class ActorCritic(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.shared = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(3 * 10 * 10, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU()
+        )
+
+        self.actor = nn.Linear(128, 4)
+        # Actor는 상, 하, 좌, 우 이렇게 4번 움직인다.
+
+        self.critic = nn.Linear(128, 1)
+        # Critic은 상태 가치 1개를 출력한다.
+    def forward(self, x):
+        x = self.shared(x)
+
+        action_logits = self.actor(x)
+        state_value = self.critic(x)
+
+        return action_logits, state_value
 
 class RouteRenderer:
     """간단한 pygame 렌더러. env.robot_pos / goal_pos / obstacles를 그려줌."""
@@ -212,21 +243,286 @@ class RouteRenderer:
     def tick(self, fps=10):
         self.clock.tick(fps)
 
+def train_ppo(
+    episodes=500,
+    gamma=0.99,
+    clip_eps=0.2,
+    lr=3e-4,
+    update_epochs=4
+):
+    env = RouteFind()
+    model = ActorCritic()
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    # 신경망 가중치를 실제로 수정하는 도구
+
+    for episode in range(episodes):
+
+        obs = env.reset() # 맵 얻어옴
+        shortest = env.get_shortest_distance()
+        done = False
+
+        # rollout 저장소
+        states = []
+        actions = []
+        rewards = []
+        log_probs = []
+        values = []
+        dones = []
+
+        total_reward = 0.0
+
+        # =========================
+        # 1. Rollout 수집
+        # =========================
+        while not done:
+
+            obs_tensor = torch.tensor(
+                obs,
+                dtype=torch.float32
+            ).unsqueeze(0)
+            # Actor-Critic은 파이토치 신경망이라 기본적으로 파이토치 텐서를 입력으로 받는다.
+            # Numpy -> Tensor -> 신경망의 변환이 필요하다
+            # Numpy: 일반적인 수치 계산용
+            # Tensor: 신경망 학습용, 자동 미분 지원
+
+            # Actor-Critic 실행
+            logits, value = model(obs_tensor)
+
+            # 행동 분포
+            dist = Categorical(logits=logits)
+
+            # 행동 샘플링
+            action = dist.sample()
+
+            # 현재 정책에서 선택 행동의 log probability
+            log_prob = dist.log_prob(action)
+
+            # 실제 환경에 행동 전달
+            next_obs, reward, done, info = env.step(
+                action.item()
+            )
+
+            # rollout 저장
+            states.append(obs_tensor.squeeze(0))
+            actions.append(action.squeeze(0))
+            rewards.append(reward)
+            log_probs.append(log_prob.squeeze(0).detach())
+            values.append(value.squeeze().detach())
+            dones.append(done)
+
+            total_reward += reward
+            obs = next_obs
+
+        # =========================
+        # 2. Return 계산
+        # =========================
+        returns = []
+        G = 0.0
+
+        for reward, done_flag in zip(
+            reversed(rewards),
+            reversed(dones)
+        ):
+            if done_flag:
+                G = 0.0
+
+            G = reward + gamma * G
+            returns.insert(0, G)
+
+        returns = torch.tensor(
+            returns,
+            dtype=torch.float32
+        )
+
+        values_tensor = torch.stack(values)
+
+        # =========================
+        # 3. Advantage 계산
+        # =========================
+        advantages = returns - values_tensor
+
+        # 안정화를 위해 normalization
+        if len(advantages) > 1:
+            advantages = (
+                advantages - advantages.mean()
+            ) / (advantages.std() + 1e-8)
+
+        # 기존 rollout을 Tensor로 합침
+        states_tensor = torch.stack(states)
+        actions_tensor = torch.stack(actions)
+
+        old_log_probs = torch.stack(log_probs)
+
+        # =========================
+        # 4. PPO Update
+        # =========================
+        for _ in range(update_epochs):
+
+            new_logits, new_values = model(states_tensor)
+
+            new_dist = Categorical(logits=new_logits)
+
+            new_log_probs = new_dist.log_prob(
+                actions_tensor
+            )
+
+            entropy = new_dist.entropy().mean()
+
+            # PPO 확률비
+            ratios = torch.exp(
+                new_log_probs - old_log_probs
+            )
+
+            # unclipped objective
+            surr1 = ratios * advantages
+
+            # clipped objective
+            surr2 = torch.clamp(
+                ratios,
+                1.0 - clip_eps,
+                1.0 + clip_eps
+            ) * advantages
+
+            actor_loss = -torch.min(
+                surr1,
+                surr2
+            ).mean()
+
+            # Critic loss
+            new_values = new_values.squeeze(-1)
+
+            critic_loss = nn.functional.mse_loss(
+                new_values,
+                returns
+            )
+
+            # 전체 loss
+            loss = (
+                actor_loss
+                + 0.5 * critic_loss
+                - 0.01 * entropy
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # =========================
+        # 5. 학습 로그
+        # =========================
+
+        print(
+            f"Episode {episode:4d} | "
+            f"Reward {total_reward:7.3f} | "
+            f"Steps {env.step_count:3d} | "
+            f"BFS {shortest} | "
+            f"Result {info.get('result')}"
+        )
+
+    return model
+
+def evaluate_ppo(model, test_episodes=5, render=True):
+    env = RouteFind()
+
+    renderer = RouteRenderer(env) if render else None
+
+    success_count = 0
+    total_success_steps = 0
+    total_efficiency = 0.0
+
+    model.eval()
+
+    for episode in range(test_episodes):
+
+        obs = env.reset()
+        bfs_distance = env.get_shortest_distance()
+
+        done = False
+
+        while not done:
+
+            # pygame 창 종료 처리
+            if render:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        return
+
+            obs_tensor = torch.tensor(
+                obs,
+                dtype=torch.float32
+            ).unsqueeze(0)
+
+            with torch.no_grad():
+                logits, value = model(obs_tensor)
+
+                # 평가에서는 가장 확률 높은 행동 선택
+                action = torch.argmax(
+                    logits,
+                    dim=1
+                ).item()
+
+            obs, reward, done, info = env.step(action)
+
+            # 화면에 현재 상태 그리기
+            if render:
+                renderer.draw()
+                renderer.tick(fps=5)
+
+        result = info.get("result")
+
+        if result == "goal_reached":
+
+            success_count += 1
+
+            ppo_steps = env.step_count
+
+            total_success_steps += ppo_steps
+
+            efficiency = bfs_distance / ppo_steps
+
+            total_efficiency += efficiency
+
+            print(
+                f"[TEST {episode}] "
+                f"Success | "
+                f"BFS={bfs_distance} | "
+                f"PPO={ppo_steps} | "
+                f"Efficiency={efficiency:.3f}"
+            )
+
+        else:
+
+            print(
+                f"[TEST {episode}] "
+                f"Fail | "
+                f"BFS={bfs_distance} | "
+                f"Result={result}"
+            )
+
+    if render:
+        pygame.quit()
+
+    success_rate = success_count / test_episodes
+
+    if success_count > 0:
+        avg_steps = total_success_steps / success_count
+        avg_efficiency = total_efficiency / success_count
+    else:
+        avg_steps = 0
+        avg_efficiency = 0
+
+    print("\n========== PPO Evaluation ==========")
+    print(f"Test Episodes : {test_episodes}")
+    print(f"Success       : {success_count}")
+    print(f"Success Rate  : {success_rate * 100:.2f}%")
+    print(f"Average Steps : {avg_steps:.2f}")
+    print(f"Path Efficiency : {avg_efficiency * 100:.2f}%")
+    print("====================================")
+
 
 if __name__ == "__main__":
-    env = RouteFind()
-    obs = env.reset()
-    print("Observation shape:", obs.shape)
-    print("BFS 최단거리:", env.get_shortest_distance())
+    trained_model = train_ppo(episodes=100000)
 
-    renderer = RouteRenderer(env)
-    renderer.draw()
-
-    # 창이 바로 안 꺼지게 유지
-    running = True
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-
-    pygame.quit()
+    evaluate_ppo(trained_model,test_episodes=5, render=True)
