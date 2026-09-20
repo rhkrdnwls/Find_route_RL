@@ -64,22 +64,37 @@ class RouteFind:
         return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
     # 맨해튼 거리 코드
 
+    def nearest_obstacle_distance(self, pos):
+        return min(
+            self.manhattan_distance(pos, obs)
+            for obs in self.obstacles
+        )
+
+
     def step(self, action):
+        goal_weight = 0.1
+        obstacle_weight = 0.01
+        step_penalty = 0.01
+
         assert action in self.ACTIONS, f"invalid action: {action}"
         # assert는 이 조건이 반드시 참이여야 하는 검사
         # action이 self.ACTIONS 안에 있어야 한다 --> 없으면 에러 발생
-
-        old_distance = self.manhattan_distance(
-            # 변화량 측정을 위해 이동 전 거리
+        # 이동 전 목적지 거리
+        old_goal_distance = self.manhattan_distance(
             self.robot_pos,
             self.goal_pos
+        )
+
+        # 이동 전 가장 가까운 장애물 거리
+        old_obs_distance = self.nearest_obstacle_distance(
+            self.robot_pos
         )
 
         dr, dc = self.ACTIONS[action]
         new_r = self.robot_pos[0] + dr # row(행) 방향으로 얼마나 움직일까
         new_c = self.robot_pos[1] + dc # col(열) 방향으로 얼마나 움직일까
 
-        reward = -0.01  # 매 스텝 작은 시간 페널티
+        reward = step_penalty  # 매 스텝 작은 시간 페널티
         done = False
         info = {}
 
@@ -87,14 +102,23 @@ class RouteFind:
         if 0 <= new_r < self.grid_size and 0 <= new_c < self.grid_size:
             self.robot_pos = (new_r, new_c)
 
-        new_distance = self.manhattan_distance(
+        new_goal_distance = self.manhattan_distance(
             self.robot_pos,
             self.goal_pos
         )
 
-        distance_change = old_distance - new_distance
+        new_obs_distance = self.nearest_obstacle_distance(
+            self.robot_pos
+        )
+        # 목적지 방향 보상
+        goal_change = old_goal_distance - new_goal_distance
+        reward += goal_weight * goal_change
 
-        reward += 0.1 * distance_change
+        # 장애물 거리 변화
+        obstacle_change = new_obs_distance - old_obs_distance
+
+        # 약한 장애물 근접 패널티 / 멀어지면 약한 보상
+        reward += obstacle_weight * obstacle_change
 
         # 장애물 충돌
         if self.robot_pos in self.obstacles:
@@ -523,6 +547,6 @@ def evaluate_ppo(model, test_episodes=5, render=True):
 
 
 if __name__ == "__main__":
-    trained_model = train_ppo(episodes=100000)
+    trained_model = train_ppo(episodes=200000)
 
     evaluate_ppo(trained_model,test_episodes=5, render=True)
