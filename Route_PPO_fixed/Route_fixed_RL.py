@@ -9,6 +9,7 @@ import torch.optim as optim
 
 from torch.distributions import Categorical
 
+MODEL_PATH = "ppo_route_model.pth"
 
 class RouteFind:
     ACTIONS = {
@@ -18,7 +19,7 @@ class RouteFind:
         3: (0, 1),   # 오른쪽
     }
 
-    def __init__(self, grid_size=10, n_obstacles=15, max_steps=100, seed=None):
+    def __init__(self, grid_size=10, n_obstacles=5, max_steps=100, seed=None):
         self.grid_size = grid_size
         self.n_obstacles = n_obstacles
         self.max_steps = max_steps
@@ -72,9 +73,10 @@ class RouteFind:
 
 
     def step(self, action):
-        goal_weight = 0.1
-        obstacle_weight = 0.01
+        goal_weight = 0.053
+        obstacle_weight = 0.014
         step_penalty = 0.01
+        invalid_move_penalty = 0.4
 
         assert action in self.ACTIONS, f"invalid action: {action}"
         # assert는 이 조건이 반드시 참이여야 하는 검사
@@ -94,13 +96,15 @@ class RouteFind:
         new_r = self.robot_pos[0] + dr # row(행) 방향으로 얼마나 움직일까
         new_c = self.robot_pos[1] + dc # col(열) 방향으로 얼마나 움직일까
 
-        reward = step_penalty  # 매 스텝 작은 시간 페널티
+        reward = -step_penalty  # 매 스텝 작은 시간 페널티
         done = False
         info = {}
 
         # 경계를 벗어나면 이동 취소 (제자리)
         if 0 <= new_r < self.grid_size and 0 <= new_c < self.grid_size:
             self.robot_pos = (new_r, new_c)
+        else:
+            reward -= invalid_move_penalty
 
         new_goal_distance = self.manhattan_distance(
             self.robot_pos,
@@ -122,13 +126,13 @@ class RouteFind:
 
         # 장애물 충돌
         if self.robot_pos in self.obstacles:
-            reward = -1.0
+            reward = -3.0
             done = True
             info["result"] = "collision"
 
         # 목적지 도착
         elif self.robot_pos == self.goal_pos:
-            reward = 1.0
+            reward = 5.0
             done = True
             info["result"] = "goal_reached"
 
@@ -274,6 +278,7 @@ def train_ppo(
     lr=3e-4,
     update_epochs=4
 ):
+    success_history = []
     env = RouteFind()
     model = ActorCritic()
 
@@ -443,6 +448,44 @@ def train_ppo(
             f"BFS {shortest} | "
             f"Result {info.get('result')}"
         )
+        result = info.get("result")
+
+        # 성공이면 1, 실패면 0
+        success = 1 if result == "goal_reached" else 0
+        success_history.append(success)
+
+        # 100 episode마다 통계 출력
+        if (episode + 1) % 100 == 0:
+
+            recent_100 = success_history[-100:]
+
+            recent_success_rate = (
+                sum(recent_100) / len(recent_100)
+            ) * 100
+
+            total_success_rate = (
+                sum(success_history) / len(success_history)
+            ) * 100
+
+            print("\n==============================")
+            print(f"Episode : {episode + 1}")
+            print(
+                f"최근 100회 성공률 : "
+                f"{recent_success_rate:.2f}%"
+            )
+            print(
+                f"전체 누적 성공률 : "
+                f"{total_success_rate:.2f}%"
+            )
+            print("==============================\n")
+
+    # 학습 모델 저장
+    torch.save(
+        model.state_dict(),
+        MODEL_PATH
+    )
+
+    print("모델 저장 완료")
 
     return model
 
@@ -479,15 +522,12 @@ def evaluate_ppo(model, test_episodes=5, render=True):
             ).unsqueeze(0)
 
             with torch.no_grad():
-                logits, value = model(obs_tensor)
+                logits, _ = model(obs_tensor)
 
-                # 평가에서는 가장 확률 높은 행동 선택
-                action = torch.argmax(
-                    logits,
-                    dim=1
-                ).item()
+                dist = Categorical(logits=logits)
+                action = dist.sample().item()
 
-            obs, reward, done, info = env.step(action)
+            obs, _, done, info = env.step(action)
 
             # 화면에 현재 상태 그리기
             if render:
@@ -545,8 +585,25 @@ def evaluate_ppo(model, test_episodes=5, render=True):
     print(f"Path Efficiency : {avg_efficiency * 100:.2f}%")
     print("====================================")
 
+def load_and_test():
+    model = ActorCritic()
+
+    model.load_state_dict(
+        torch.load(
+            MODEL_PATH, 
+            weights_only=True
+        )
+    )
+
+    model.eval()
+
+    evaluate_ppo(
+        model, 
+        test_episodes=10,
+        render=True
+    )
 
 if __name__ == "__main__":
-    trained_model = train_ppo(episodes=200000)
+    trained_model = train_ppo(episodes=1000)
 
-    evaluate_ppo(trained_model,test_episodes=5, render=True)
+    load_and_test()
