@@ -3,9 +3,15 @@ import pygame
 from collections import deque
 import numpy as np
 
+SEED = 42
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 from torch.distributions import Categorical
 
@@ -19,7 +25,7 @@ class RouteFind:
         3: (0, 1),   # 오른쪽
     }
 
-    def __init__(self, grid_size=10, n_obstacles=5, max_steps=100, seed=None):
+    def __init__(self, grid_size=10, n_obstacles=10, max_steps=100, seed=None):
         self.grid_size = grid_size
         self.n_obstacles = n_obstacles
         self.max_steps = max_steps
@@ -29,6 +35,7 @@ class RouteFind:
         self.goal_pos = None
         self.obstacles = []
         self.step_count = 0
+        self.invalid_count = 0
 
     def reset(self):
         while True: # 맵은 계속 생성
@@ -44,7 +51,7 @@ class RouteFind:
 
             # 장애물 배치
             self.obstacles = []
-            for _ in range(self.n_obstacles):
+            for _ in range(self.n_obstacles):   
                 pos = self._random_empty_cell(occupied)
                 occupied.add(pos)
                 self.obstacles.append(pos)
@@ -58,6 +65,7 @@ class RouteFind:
             break; # 아니라면 맵 사용
 
         self.step_count = 0
+        self.invalid_count = 0
 
         return self._get_obs()
     
@@ -73,10 +81,12 @@ class RouteFind:
 
 
     def step(self, action):
-        goal_weight = 0.053
-        obstacle_weight = 0.014
-        step_penalty = 0.01
-        invalid_move_penalty = 0.4
+        goal_weight = 0.05 # 목표에 다가갈 때 주어지는 페널티
+        obstacle_weight = 0.005 # 장애물과의 거리 변화에 붙는 가중치
+        step_penalty = 0.01 # Step 움직일 때마다 주는 작은 페널티
+        invalid_move_penalty = 0.3 # 벽 안쪽에 있게 
+
+        self.step_count += 1
 
         assert action in self.ACTIONS, f"invalid action: {action}"
         # assert는 이 조건이 반드시 참이여야 하는 검사
@@ -105,6 +115,7 @@ class RouteFind:
             self.robot_pos = (new_r, new_c)
         else:
             reward -= invalid_move_penalty
+            self.invalid_count += 1
 
         new_goal_distance = self.manhattan_distance(
             self.robot_pos,
@@ -126,17 +137,16 @@ class RouteFind:
 
         # 장애물 충돌
         if self.robot_pos in self.obstacles:
-            reward = -3.0
+            reward = -4.0
             done = True
             info["result"] = "collision"
 
         # 목적지 도착
         elif self.robot_pos == self.goal_pos:
-            reward = 5.0
+            reward = 7.0
             done = True
             info["result"] = "goal_reached"
 
-        self.step_count += 1
 
         if self.step_count >= self.max_steps:
             done = True
@@ -162,7 +172,6 @@ class RouteFind:
         # 2번 채널: 목적지
         gr, gc = self.goal_pos
         grid[2, gr, gc] = 1.0
-
         return grid
         # 하나의 grid에 1, 2, 3 이렇게 넣으면 신경망이 숫자 크기에 의미 부여할 수 있음
         # 채널을 분리해 장애물 채널, 로봇 채널, 목적지 채널 --> 이렇게 나눈다.
@@ -223,7 +232,7 @@ class ActorCritic(nn.Module):
 
         self.critic = nn.Linear(128, 1)
         # Critic은 상태 가치 1개를 출력한다.
-    def forward(self, x):
+    def forward(self, x):    
         x = self.shared(x)
 
         action_logits = self.actor(x)
@@ -272,220 +281,513 @@ class RouteRenderer:
         self.clock.tick(fps)
 
 def train_ppo(
-    episodes=500,
+    episodes=5000,
     gamma=0.99,
+    gae_lambda=0.95,
     clip_eps=0.2,
-    lr=3e-4,
-    update_epochs=4
+    lr=2e-4,
+    rollout_steps=2048,
+    minibatch_size=256,
+    update_epochs=4,
+    entropy_coef=0.01,
+    value_coef=0.5
 ):
-    success_history = []
     env = RouteFind()
     model = ActorCritic()
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    # 신경망 가중치를 실제로 수정하는 도구
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=lr
+    )
 
-    for episode in range(episodes):
+    # 성공 여부 기록
+    success_history = []
 
-        obs = env.reset() # 맵 얻어옴
-        shortest = env.get_shortest_distance()
-        done = False
+    # 현재까지 종료된 episode 개수
+    episode_count = 0
 
-        # rollout 저장소
+    # 첫 episode 시작
+    obs = env.reset()
+
+    # reset 직후의 BFS 최단거리
+    shortest = env.get_shortest_distance()
+
+    # 현재 episode 통계
+    episode_reward = 0.0
+    action_counts = [0, 0, 0, 0]
+
+    # =========================================================
+    # 전체 학습
+    # =========================================================
+    while episode_count < episodes:
+
+        # -----------------------------------------------------
+        # Rollout Buffer 초기화
+        # -----------------------------------------------------
         states = []
         actions = []
         rewards = []
+        dones = []
         log_probs = []
         values = []
-        dones = []
 
-        total_reward = 0.0
+        # =====================================================
+        # rollout_steps 만큼 경험 수집
+        # =====================================================
+        for _ in range(rollout_steps):
 
-        # =========================
-        # 1. Rollout 수집
-        # =========================
-        while not done:
-
+            # NumPy observation → Tensor
             obs_tensor = torch.tensor(
                 obs,
                 dtype=torch.float32
             ).unsqueeze(0)
-            # Actor-Critic은 파이토치 신경망이라 기본적으로 파이토치 텐서를 입력으로 받는다.
-            # Numpy -> Tensor -> 신경망의 변환이 필요하다
-            # Numpy: 일반적인 수치 계산용
-            # Tensor: 신경망 학습용, 자동 미분 지원
 
-            # Actor-Critic 실행
-            logits, value = model(obs_tensor)
+            # 현재 정책으로 행동 선택
+            with torch.no_grad():
 
-            # 행동 분포
-            dist = Categorical(logits=logits)
+                logits, value = model(obs_tensor)
 
-            # 행동 샘플링
-            action = dist.sample()
+                dist = Categorical(
+                    logits=logits
+                )
 
-            # 현재 정책에서 선택 행동의 log probability
-            log_prob = dist.log_prob(action)
+                # 정책 확률분포에서 행동 sampling
+                action = dist.sample()
+
+                # 선택 행동의 log probability
+                log_prob = dist.log_prob(action)
+
+            action_item = action.item()
+
+            # 행동 횟수 기록
+            action_counts[action_item] += 1
 
             # 실제 환경에 행동 전달
             next_obs, reward, done, info = env.step(
-                action.item()
+                action_item
             )
 
-            # rollout 저장
-            states.append(obs_tensor.squeeze(0))
-            actions.append(action.squeeze(0))
-            rewards.append(reward)
-            log_probs.append(log_prob.squeeze(0).detach())
-            values.append(value.squeeze().detach())
-            dones.append(done)
+            episode_reward += reward
 
-            total_reward += reward
+            # -------------------------------------------------
+            # Rollout 저장
+            # -------------------------------------------------
+            states.append(
+                obs_tensor.squeeze(0)
+            )
+
+            actions.append(
+                action.squeeze(0)
+            )
+
+            rewards.append(
+                reward
+            )
+
+            dones.append(
+                done
+            )
+
+            log_probs.append(
+                log_prob.squeeze(0)
+            )
+
+            values.append(
+                value.squeeze()
+            )
+
             obs = next_obs
 
-        # =========================
-        # 2. Return 계산
-        # =========================
-        returns = []
-        G = 0.0
+            # =================================================
+            # Episode 종료
+            # =================================================
+            if done:
 
-        for reward, done_flag in zip(
-            reversed(rewards),
-            reversed(dones)
+                episode_count += 1
+
+                result = info.get("result")
+
+                # goal_reached = 1
+                # 나머지 = 0
+                success = (
+                    1
+                    if result == "goal_reached"
+                    else 0
+                )
+
+                success_history.append(success)
+
+                # ------------------------------------------------
+                # Episode별 로그
+                # ------------------------------------------------
+                print(
+                    f"Episode {episode_count:4d} | "
+                    f"Reward {episode_reward:7.3f} | "
+                    f"Steps {env.step_count:3d} | "
+                    f"Invalid {env.invalid_count:3d} | "
+                    f"BFS {shortest} | "
+                    f"Result {result} | "
+                    f"UP {action_counts[0]} | "
+                    f"DOWN {action_counts[1]} | "
+                    f"LEFT {action_counts[2]} | "
+                    f"RIGHT {action_counts[3]}"
+                )
+                # 목표 episode까지 다 학습했으면 종료
+                if episode_count >= episodes:
+                    break
+
+                # ------------------------------------------------
+                # 다음 episode 시작
+                # ------------------------------------------------
+                obs = env.reset()
+
+                shortest = (
+                    env.get_shortest_distance()
+                )
+
+                episode_reward = 0.0
+
+                action_counts = [
+                    0, 0, 0, 0
+                ]
+
+        # =====================================================
+        # Rollout 수집 종료
+        # =====================================================
+
+        rollout_size = len(states)
+
+        if rollout_size == 0:
+            continue
+
+        # -----------------------------------------------------
+        # rollout 마지막 상태의 Value
+        # -----------------------------------------------------
+        if dones[-1]:
+
+            last_value = 0.0
+
+        else:
+
+            with torch.no_grad():
+
+                last_obs_tensor = torch.tensor(
+                    obs,
+                    dtype=torch.float32
+                ).unsqueeze(0)
+
+                _, last_value_tensor = model(
+                    last_obs_tensor
+                )
+
+                last_value = (
+                    last_value_tensor.item()
+                )
+
+        # =====================================================
+        # GAE 계산
+        # =====================================================
+
+        advantages = [
+            0.0
+            for _ in range(rollout_size)
+        ]
+
+        gae = 0.0
+
+        for t in reversed(
+            range(rollout_size)
         ):
-            if done_flag:
-                G = 0.0
 
-            G = reward + gamma * G
-            returns.insert(0, G)
+            if t == rollout_size - 1:
+                next_value = last_value
 
-        returns = torch.tensor(
-            returns,
+            else:
+                next_value = (
+                    values[t + 1].item()
+                )
+
+            # done이면 미래가치 사용하지 않음
+            not_done = (
+                1.0
+                - float(dones[t])
+            )
+
+            # TD Error
+            delta = (
+                rewards[t]
+                + gamma
+                * next_value
+                * not_done
+                - values[t].item()
+            )
+
+            # GAE
+            gae = (
+                delta
+                + gamma
+                * gae_lambda
+                * not_done
+                * gae
+            )
+
+            advantages[t] = gae
+
+        # =====================================================
+        # Tensor 변환
+        # =====================================================
+
+        states_tensor = torch.stack(
+            states
+        )
+
+        actions_tensor = torch.stack(
+            actions
+        ).long()
+
+        old_log_probs_tensor = torch.stack(
+            log_probs
+        )
+
+        values_tensor = torch.stack(
+            values
+        )
+
+        advantages_tensor = torch.tensor(
+            advantages,
             dtype=torch.float32
         )
 
-        values_tensor = torch.stack(values)
+        # Return = Advantage + V(s)
+        returns_tensor = (
+            advantages_tensor
+            + values_tensor
+        )
 
-        # =========================
-        # 3. Advantage 계산
-        # =========================
-        advantages = returns - values_tensor
+        # =====================================================
+        # Advantage 정규화
+        # =====================================================
 
-        # 안정화를 위해 normalization
-        if len(advantages) > 1:
-            advantages = (
-                advantages - advantages.mean()
-            ) / (advantages.std() + 1e-8)
+        if len(advantages_tensor) > 1:
 
-        # 기존 rollout을 Tensor로 합침
-        states_tensor = torch.stack(states)
-        actions_tensor = torch.stack(actions)
+            advantages_tensor = (
+                advantages_tensor
+                - advantages_tensor.mean()
+            ) / (
+                advantages_tensor.std()
+                + 1e-8
+            )
 
-        old_log_probs = torch.stack(log_probs)
+        # =====================================================
+        # PPO Minibatch Update
+        # =====================================================
 
-        # =========================
-        # 4. PPO Update
-        # =========================
         for _ in range(update_epochs):
 
-            new_logits, new_values = model(states_tensor)
-
-            new_dist = Categorical(logits=new_logits)
-
-            new_log_probs = new_dist.log_prob(
-                actions_tensor
+            # rollout 데이터 섞기
+            indices = torch.randperm(
+                rollout_size
             )
 
-            entropy = new_dist.entropy().mean()
+            # -------------------------------------------------
+            # minibatch 단위 학습
+            # -------------------------------------------------
+            for start in range(
+                0,
+                rollout_size,
+                minibatch_size
+            ):
 
-            # PPO 확률비
-            ratios = torch.exp(
-                new_log_probs - old_log_probs
-            )
+                end = (
+                    start
+                    + minibatch_size
+                )
 
-            # unclipped objective
-            surr1 = ratios * advantages
+                mb_idx = indices[
+                    start:end
+                ]
 
-            # clipped objective
-            surr2 = torch.clamp(
-                ratios,
-                1.0 - clip_eps,
-                1.0 + clip_eps
-            ) * advantages
+                # ---------------------------------------------
+                # minibatch 데이터
+                # ---------------------------------------------
 
-            actor_loss = -torch.min(
-                surr1,
-                surr2
-            ).mean()
+                mb_states = (
+                    states_tensor[mb_idx]
+                )
 
-            # Critic loss
-            new_values = new_values.squeeze(-1)
+                mb_actions = (
+                    actions_tensor[mb_idx]
+                )
 
-            critic_loss = nn.functional.mse_loss(
-                new_values,
-                returns
-            )
+                mb_old_log_probs = (
+                    old_log_probs_tensor[
+                        mb_idx
+                    ]
+                )
 
-            # 전체 loss
-            loss = (
-                actor_loss
-                + 0.5 * critic_loss
-                - 0.01 * entropy
-            )
+                mb_advantages = (
+                    advantages_tensor[
+                        mb_idx
+                    ]
+                )
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                mb_returns = (
+                    returns_tensor[
+                        mb_idx
+                    ]
+                )
 
-        # =========================
-        # 5. 학습 로그
-        # =========================
+                # ---------------------------------------------
+                # 현재 정책에서 다시 계산
+                # ---------------------------------------------
+
+                new_logits, new_values = model(
+                    mb_states
+                )
+
+                new_dist = Categorical(
+                    logits=new_logits
+                )
+
+                new_log_probs = (
+                    new_dist.log_prob(
+                        mb_actions
+                    )
+                )
+
+                entropy = (
+                    new_dist.entropy().mean()
+                )
+
+                # ---------------------------------------------
+                # PPO Ratio
+                # ---------------------------------------------
+
+                ratio = torch.exp(
+                    new_log_probs
+                    - mb_old_log_probs
+                )
+
+                # ---------------------------------------------
+                # PPO Clipped Objective
+                # ---------------------------------------------
+
+                surr1 = (
+                    ratio
+                    * mb_advantages
+                )
+
+                surr2 = (
+                    torch.clamp(
+                        ratio,
+                        1.0 - clip_eps,
+                        1.0 + clip_eps
+                    )
+                    * mb_advantages
+                )
+
+                actor_loss = -torch.min(
+                    surr1,
+                    surr2
+                ).mean()
+
+                # ---------------------------------------------
+                # Critic Loss
+                # ---------------------------------------------
+
+                critic_loss = (
+                    nn.functional.mse_loss(
+                        new_values.squeeze(-1),
+                        mb_returns
+                    )
+                )
+
+                # ---------------------------------------------
+                # 전체 PPO Loss
+                # ---------------------------------------------
+
+                loss = (
+                    actor_loss
+                    + value_coef
+                    * critic_loss
+                    - entropy_coef
+                    * entropy
+                )
+
+                # ---------------------------------------------
+                # Gradient Update
+                # ---------------------------------------------
+
+                optimizer.zero_grad()
+
+                loss.backward()
+
+                # Gradient 폭주 방지
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=0.5
+                )
+
+                optimizer.step()
+
+    # =========================================================
+    # 학습 종료 후 전체 통계 출력
+    # =========================================================
+
+    print("\n\n========== Training Summary ==========")
+
+    total_episodes = len(success_history)
+
+    # 1000 episode 단위 성공률
+    for start in range(0, total_episodes, 1000):
+
+        end = min(start + 1000, total_episodes)
+
+        section = success_history[start:end]
+
+        section_success_rate = (
+            sum(section) / len(section)
+        ) * 100
 
         print(
-            f"Episode {episode:4d} | "
-            f"Reward {total_reward:7.3f} | "
-            f"Steps {env.step_count:3d} | "
-            f"BFS {shortest} | "
-            f"Result {info.get('result')}"
+            f"Episode {start + 1:4d} ~ {end:4d} "
+            f"| Success Rate : "
+            f"{section_success_rate:.2f}%"
         )
-        result = info.get("result")
 
-        # 성공이면 1, 실패면 0
-        success = 1 if result == "goal_reached" else 0
-        success_history.append(success)
 
-        # 100 episode마다 통계 출력
-        if (episode + 1) % 100 == 0:
+    # 전체 누적 성공률
+    total_success_rate = (
+        sum(success_history)
+        / len(success_history)
+    ) * 100
 
-            recent_100 = success_history[-100:]
+    print("--------------------------------------")
 
-            recent_success_rate = (
-                sum(recent_100) / len(recent_100)
-            ) * 100
+    print(
+        f"Total Episodes   : {total_episodes}"
+    )
 
-            total_success_rate = (
-                sum(success_history) / len(success_history)
-            ) * 100
+    print(
+        f"Total Success    : {sum(success_history)}"
+    )
 
-            print("\n==============================")
-            print(f"Episode : {episode + 1}")
-            print(
-                f"최근 100회 성공률 : "
-                f"{recent_success_rate:.2f}%"
-            )
-            print(
-                f"전체 누적 성공률 : "
-                f"{total_success_rate:.2f}%"
-            )
-            print("==============================\n")
+    print(
+        f"Overall Success Rate : "
+        f"{total_success_rate:.2f}%"
+    )
 
-    # 학습 모델 저장
+    print("======================================")
+    # =========================================================
+    # 모든 학습 종료 후 최종 모델만 저장
+    # =========================================================
+
     torch.save(
         model.state_dict(),
         MODEL_PATH
     )
 
-    print("모델 저장 완료")
+    print("\n모델 저장 완료")
 
     return model
 
@@ -599,11 +901,11 @@ def load_and_test():
 
     evaluate_ppo(
         model, 
-        test_episodes=10,
-        render=True
+        test_episodes=100,
+        render=False
     )
 
 if __name__ == "__main__":
-    trained_model = train_ppo(episodes=1000)
+    trained_model = train_ppo(episodes=500000)
 
     load_and_test()
