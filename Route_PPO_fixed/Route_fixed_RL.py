@@ -280,6 +280,56 @@ class RouteRenderer:
     def tick(self, fps=10):
         self.clock.tick(fps)
 
+def evaluate_validation(model, val_seeds):
+    success_count = 0
+
+    # 현재 training/eval 상태 기억
+    was_training = model.training
+
+    model.eval()
+
+    with torch.no_grad():
+
+        for seed in val_seeds:
+
+            # seed마다 항상 동일한 맵 생성
+            env = RouteFind(seed=seed)
+
+            obs = env.reset()
+
+            done = False
+
+            while not done:
+
+                obs_tensor = torch.tensor(
+                    obs,
+                    dtype=torch.float32
+                ).unsqueeze(0)
+
+                logits, _ = model(obs_tensor)
+
+                # Validation에서는 랜덤 sample이 아니라
+                # 가장 확률 높은 행동 사용
+                action = torch.argmax(
+                    logits,
+                    dim=1
+                ).item()
+
+                obs, _, done, info = env.step(action)
+
+            if info.get("result") == "goal_reached":
+                success_count += 1
+
+    success_rate = (
+        success_count / len(val_seeds)
+    )
+
+    # 다시 학습 모드 복구
+    if was_training:
+        model.train()
+
+    return success_rate
+
 def train_ppo(
     episodes=5000,
     gamma=0.99,
@@ -290,7 +340,14 @@ def train_ppo(
     minibatch_size=256,
     update_epochs=4,
     entropy_coef=0.01,
-    value_coef=0.5
+    value_coef=0.5,
+
+    # Early Stopping
+    eval_interval=10000,
+    patience=10,
+    min_delta=0.005,
+    validation_size=300,
+    early_stop_start=300000
 ):
     env = RouteFind()
     model = ActorCritic()
@@ -305,6 +362,20 @@ def train_ppo(
 
     # 현재까지 종료된 episode 개수
     episode_count = 0
+
+    val_seeds = [
+        100000 + i
+        for i in range(validation_size)
+    ]
+
+    # 지금까지 가장 높은 validation 성공률
+    best_val_success = -1.0
+    # 몇 번 연속 개선되지 않았는지
+    no_improve_count = 0
+    # 다음 validation 시점
+    next_eval_episode = eval_interval
+    # Early stopping 여부
+    early_stop = False
 
     # 첫 episode 시작
     obs = env.reset()
@@ -730,6 +801,89 @@ def train_ppo(
 
                 optimizer.step()
 
+        if episode_count >= next_eval_episode:
+
+            val_success = evaluate_validation(
+                model,
+                val_seeds
+            )
+
+            print(
+                f"\n[VALIDATION] "
+                f"Episode {episode_count} | "
+                f"Success Rate : "
+                f"{val_success * 100:.2f}%"
+            )
+
+            # -------------------------------------------------
+            # 최고 validation 성능 갱신
+            # -------------------------------------------------
+
+            if val_success > best_val_success + min_delta:
+
+                best_val_success = val_success
+                no_improve_count = 0
+
+                torch.save(
+                    model.state_dict(),
+                    MODEL_PATH
+                )
+
+                print(
+                    f"[BEST MODEL] "
+                    f"Validation Success : "
+                    f"{best_val_success * 100:.2f}% "
+                    f"→ 모델 저장"
+                )
+
+            else:
+
+                no_improve_count += 1
+
+                print(
+                    f"[NO IMPROVEMENT] "
+                    f"{no_improve_count}/{patience}"
+                )
+
+            # -------------------------------------------------
+            # Early Stopping
+            # -------------------------------------------------
+
+            if (
+                episode_count >= early_stop_start
+                and no_improve_count >= patience
+            ):
+
+                print(
+                    "\n========== Early Stopping =========="
+                )
+
+                print(
+                    f"Episode : {episode_count}"
+                )
+
+                print(
+                    f"Best Validation Success : "
+                    f"{best_val_success * 100:.2f}%"
+                )
+
+                print(
+                    f"No Improvement : "
+                    f"{no_improve_count} validations"
+                )
+
+                print(
+                    "===================================="
+                )
+
+                early_stop = True
+
+            # 다음 validation 시점
+            next_eval_episode += eval_interval
+
+        if early_stop:
+            break
+
     # =========================================================
     # 학습 종료 후 전체 통계 출력
     # =========================================================
@@ -782,14 +936,25 @@ def train_ppo(
     # 모든 학습 종료 후 최종 모델만 저장
     # =========================================================
 
-    torch.save(
-        model.state_dict(),
-        MODEL_PATH
+    model.load_state_dict(
+        torch.load(
+            MODEL_PATH,
+            weights_only=True
+        )
     )
 
-    print("\n모델 저장 완료")
+    model.eval()
 
-    return model
+    print(
+        "\nBest Validation Model 불러오기 완료"
+    )
+
+    print(
+        f"Best Validation Success Rate : "
+        f"{best_val_success * 100:.2f}%"
+    )
+
+    return model    
 
 def evaluate_ppo(model, test_episodes=5, render=True):
     env = RouteFind()
@@ -906,6 +1071,6 @@ def load_and_test():
     )
 
 if __name__ == "__main__":
-    trained_model = train_ppo(episodes=500000)
+    trained_model = train_ppo(episodes=1000000)
 
     load_and_test()
