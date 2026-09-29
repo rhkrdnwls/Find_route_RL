@@ -137,7 +137,7 @@ class RouteFind:
 
         # 장애물 충돌
         if self.robot_pos in self.obstacles:
-            reward = -4.0
+            reward = -5.0
             done = True
             info["result"] = "collision"
 
@@ -358,7 +358,7 @@ def train_ppo(
     )
 
     # 성공 여부 기록
-    success_history = []
+    success_history = []    
 
     # 현재까지 종료된 episode 개수
     episode_count = 0
