@@ -75,7 +75,7 @@ class RouteFind:
 
     def nearest_obstacle_distance(self, pos):
         return min(
-            self.manhattan_distance(pos, obs)
+            self.manhattan_distance(pos, obs)   
             for obs in self.obstacles
         )
 
