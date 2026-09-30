@@ -3,15 +3,18 @@
 PPO(Proximal Policy Optimization)로 2D 그리드 환경에서 로봇이 장애물을 회피하며 시작점에서 목적지까지 경로를 탐색하도록 학습하는 프로젝트입니다.
 
 ## Environment
+<img align="right" src="https://github.com/user-attachments/assets/d1fbae7f-c271-45e8-9f45-02d2d57f6bde" width="45%">
 
 | 항목 | 값 |
-|---|---|
-| Grid Size | 10 × 10 |
-| Start | (0, 0) |
-| Goal | (9, 9) |
-| Action Space | Up / Down / Left / Right |
-| Max Steps | 100 |
-| Obstacles | Random placement (BFS로 도달 불가능한 맵은 제외) |
+| :--- | :--- |
+| **Grid Size** | 10 × 10 |
+| **Start** | (0, 0) |
+| **Goal** | (9, 9) |
+| **Action Space** | Up / Down / Left / Right |
+| **Max Steps** | 100 |
+| **Obstacles** | Random placement (BFS로 도달 불가능한 맵은 제외) |
+
+<br clear="both">
 
 ## Observation Space
 
