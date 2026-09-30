@@ -1071,6 +1071,6 @@ def load_and_test():
     )
 
 if __name__ == "__main__":
-    trained_model = train_ppo(episodes=1000000)
+    # trained_model = train_ppo(episodes=1000000)
 
     load_and_test()
